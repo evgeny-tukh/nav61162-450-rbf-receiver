@@ -7,12 +7,10 @@
 #include "61162_450_defs.h"
 #include "61162_450_interface.h"
 
-namespace Nav61162_450 {
-    bool extractHeader_v1 (uint8_t *stream, Header1 *headerBuffer);
-    bool extractHeader_v2 (uint8_t *stream, Header2 *headerBuffer);
-}
+bool extractHeader_v1 (uint8_t *stream, Header1 *headerBuffer);
+bool extractHeader_v2 (uint8_t *stream, Header2 *headerBuffer);
 
-bool Nav61162_450::extractHeader_v1 (uint8_t *stream, Header1 *header) {
+bool extractHeader_v1 (uint8_t *stream, Header1 *header) {
     memcpy (header, stream, sizeof (Header1));
 
     header->version = 1;
@@ -24,7 +22,7 @@ bool Nav61162_450::extractHeader_v1 (uint8_t *stream, Header1 *header) {
     return true;
 }
 
-bool Nav61162_450::extractHeader_v2 (uint8_t *stream, Header2 *header) {
+bool extractHeader_v2 (uint8_t *stream, Header2 *header) {
     memcpy (header, stream, sizeof (Header2));
 
     header->version = 2;
@@ -37,32 +35,32 @@ bool Nav61162_450::extractHeader_v2 (uint8_t *stream, Header2 *header) {
     return true;
 }
 
-bool Nav61162_450::extractHeader (
+bool extractHeader (
     uint8_t *stream,    // incoming byte stream
     void *headerBuffer, // a pointer to fill header in (will be parsed according to version field)
     uint8_t *version,   // version number; the user should assing headerBuffer to a typized pointer accordingly
     size_t *size        // number of bytes parsed; stream pointer should be shifted accodingly
 ) {
     bool result = false;
-    Nav61162_450::Header *hdr = (Nav61162_450::Header *) stream;
+    Header *hdr = (Header *) stream;
     uint16_t verPresent = lsb2msb16 (hdr->version);
     
     // Find out about the version
     switch (verPresent) {
         case 1: {
-            extractHeader_v1 (stream, (Nav61162_450::Header1 *) headerBuffer);
+            extractHeader_v1 (stream, (Header1 *) headerBuffer);
 
             result = true;
             *version = 1;
-            *size = sizeof (Nav61162_450::Header1);
+            *size = sizeof (Header1);
             break;
         }
         case 2: {
-            extractHeader_v2 (stream, (Nav61162_450::Header2 *) headerBuffer);
+            extractHeader_v2 (stream, (Header2 *) headerBuffer);
 
             result = true;
             *version = 2;
-            *size = sizeof (Nav61162_450::Header2);
+            *size = sizeof (Header2);
             break;
         }
     }
@@ -70,8 +68,8 @@ bool Nav61162_450::extractHeader (
     return result;
 }
 
-void Nav61162_450::composeHeader_v1 (
-    TokenType tokenType,
+void composeHeader_v1 (
+    MsgTokenType tokenType,
     char *srcTalker,        // EI or VR, in our case
     uint16_t srcInstance,   // 0001..9999
     char *destTalker,       // EI or VR, in our case
@@ -93,8 +91,8 @@ void Nav61162_450::composeHeader_v1 (
     header->maxSeqNum = lsb2msb32 (maxSeqNum);
 }
 
-void Nav61162_450::composeHeader_v2 (
-    TokenType tokenType,
+void composeHeader_v2 (
+    MsgTokenType tokenType,
     char *srcTalker,        // EI or VR, in our case
     uint16_t srcInstance,   // 0001..9999
     char *destTalker,       // EI or VR, in our case
@@ -121,8 +119,8 @@ void Nav61162_450::composeHeader_v2 (
     header->device = device;
 }
 
-void Nav61162_450::composeHeaderSimple_v1 (
-    TokenType tokenType,
+void composeHeaderSimple_v1 (
+    MsgTokenType tokenType,
     uint8_t *sourceID,      // immediate 6 chars here
     uint8_t *destID,        // immediate 6 chars here
     uint16_t type,
@@ -142,8 +140,8 @@ void Nav61162_450::composeHeaderSimple_v1 (
     header->maxSeqNum = lsb2msb32 (maxSeqNum);
 }
 
-void Nav61162_450::composeHeaderSimple_v2 (
-    TokenType tokenType,
+void composeHeaderSimple_v2 (
+    MsgTokenType tokenType,
     uint8_t *sourceID,      // immediate 6 chars here
     uint8_t *destID,        // immediate 6 chars here
     uint16_t type,
@@ -168,7 +166,7 @@ void Nav61162_450::composeHeaderSimple_v2 (
     header->device = device;
 }
 
-void Nav61162_450::extractFileDescriptor_v1 (
+void extractFileDescriptor_v1 (
     uint8_t *stream,        // incoming byte stream
     size_t *fileDescSize,   // file descriptor size; in fact, number of bytes parsed; stream pointer should be shifted accodingly
     size_t *fileSize,       // size of file transferring
@@ -200,7 +198,7 @@ void Nav61162_450::extractFileDescriptor_v1 (
     memcpy (statusInfo, fileDesc->textInfo + *dataTypeSize, *statusInfoSize);
 }
 
-void Nav61162_450::extractFileDescriptor_v2 (
+void extractFileDescriptor_v2 (
     uint8_t *stream,        // incoming byte stream
     size_t *fileDescSize,   // file descriptor size; in fact, number of bytes parsed; stream pointer should be shifted accodingly
     size_t *fileSize,       // size of file transferring
@@ -230,7 +228,7 @@ void Nav61162_450::extractFileDescriptor_v2 (
     memcpy (statusInfo, srcStatusLength + 1, *statusInfoSize);
 }
 
-void Nav61162_450::composeFileDesc_v1 (
+void composeFileDesc_v1 (
     size_t fileLength,
     uint16_t ackStatus,
     uint8_t device,
@@ -256,7 +254,7 @@ void Nav61162_450::composeFileDesc_v1 (
     memcpy (fileDesc->textInfo + dataTypeLen + 1, statusAndInfo, statusAndInfoLen + 1);
 }
 
-void Nav61162_450::composeFileDesc_v2 (
+void composeFileDesc_v2 (
     size_t fileLength,
     uint16_t ackStatus,
     uint16_t ackDestPort,
@@ -284,7 +282,7 @@ void Nav61162_450::composeFileDesc_v2 (
     memcpy (statusLength + 1, statusAndInfo, statusAndInfoLen + 1);
 }
 
-void Nav61162_450::composeAck_v1 (Header1 *incomingHdr, Header1 *ackHeader, uint32_t seqNum) {
+void composeAck_v1 (Header1 *incomingHdr, Header1 *ackHeader, uint32_t seqNum) {
     composeHeaderSimple_v1 (
         getTokenType (incomingHdr->token),
         incomingHdr->destID,
@@ -297,25 +295,27 @@ void Nav61162_450::composeAck_v1 (Header1 *incomingHdr, Header1 *ackHeader, uint
     );
 }
 
-void Nav61162_450::composeFinalAck_v1 (Header1 *incomingHdr, Header1 *ackHeader) {
+void composeFinalAck_v1 (Header1 *incomingHdr, Header1 *ackHeader) {
     composeAck_v1 (incomingHdr, ackHeader);
 }
 
-void Nav61162_450::composeAck_v2 (Header2 *incomingHdr, Header2 *ackHeader, uint32_t seqNum) {
+void composeAck_v2 (Header2 *incomingHdr, Header2 *ackHeader, uint32_t seqNum) {
     composeHeaderSimple_v2 (
         getTokenType (incomingHdr->token),
         incomingHdr->destID,
         incomingHdr->sourceID,
         MsgType::ACK,
         incomingHdr->blockID,
-        incomingHdr->maxSeqNum,
         seqNum == 0xFFFFFFFF ? incomingHdr->seqNum : seqNum,
+        0, //incomingHdr->maxSeqNum, // No max seq num for ack
         incomingHdr->device,
         incomingHdr->channel,
         ackHeader
     );
 }
 
-void Nav61162_450::composeFinalAck_v2 (Header2 *incomingHdr, Header2 *ackHeader) {
+void composeFinalAck_v2 (Header2 *incomingHdr, Header2 *ackHeader) {
     composeAck_v2 (incomingHdr, ackHeader);
+
+    ackHeader->maxSeqNum = 0;
 }

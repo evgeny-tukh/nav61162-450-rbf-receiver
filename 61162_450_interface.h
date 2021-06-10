@@ -1,9 +1,5 @@
 #include  "61162_450_defs.h"
 
-#ifdef __cplusplus
-namespace Nav61162_450 {
-#endif
-
 bool extractHeader (
     uint8_t *stream,        // incoming byte stream
     void *headerBuffer,     // a pointer to fill header in (will be parsed according to version field)
@@ -12,7 +8,7 @@ bool extractHeader (
 );
 
 void composeHeader_v1 (
-    TokenType tokenType,
+    MsgTokenType tokenType,
     char *srcTalker,        // EI or VR, in our case
     uint16_t srcInstance,   // 0001..9999
     char *destTalker,       // EI or VR, in our case
@@ -24,7 +20,7 @@ void composeHeader_v1 (
     Header1 *header
 );
 void composeHeader_v2 (
-    TokenType tokenType,
+    MsgTokenType tokenType,
     char *srcTalker,        // EI or VR, in our case
     uint16_t srcInstance,   // 0001..9999
     char *destTalker,       // EI or VR, in our case
@@ -39,7 +35,7 @@ void composeHeader_v2 (
 );
 
 void composeHeaderSimple_v1 (
-    TokenType tokenType,
+    MsgTokenType tokenType,
     uint8_t *sourceID,      // immediate 6 chars here
     uint8_t *destID,        // immediate 6 chars here
     uint16_t type,
@@ -49,7 +45,7 @@ void composeHeaderSimple_v1 (
     Header1 *header
 );
 void composeHeaderSimple_v2 (
-    TokenType tokenType,
+    MsgTokenType tokenType,
     uint8_t *sourceID,      // immediate 6 chars here
     uint8_t *destID,        // immediate 6 chars here
     uint16_t type,
@@ -110,6 +106,3 @@ void composeAck_v2 (Header2 *incomingHdr, Header2 *ackHeader, uint32_t seqNum = 
 void composeFinalAck_v1 (Header1 *incomingHdr, Header1 *ackHeader);
 void composeFinalAck_v2 (Header2 *incomingHdr, Header2 *ackHeader);
 
-#ifdef __cplusplus
-}
-#endif

@@ -6,15 +6,12 @@
 #include <string.h>
 #include <stdio.h>
 #include "61162_450_defs.h"
-#include <Windows.h>
 
 #define TITLE_GAP   "\n***********************"
 
-namespace Nav61162_450 {
-    HANDLE openLog (char *, bool);
-}
+FILE *openLog (char *);
 
-uint16_t Nav61162_450::lsb2msb16 (uint16_t value) {
+uint16_t lsb2msb16 (uint16_t value) {
     uint8_t *bytes = (uint8_t *) & value;
     
     uint8_t b0 = bytes[0];
@@ -26,7 +23,7 @@ uint16_t Nav61162_450::lsb2msb16 (uint16_t value) {
     return value;
 }
 
-uint32_t Nav61162_450::lsb2msb32 (uint32_t value) {
+uint32_t lsb2msb32 (uint32_t value) {
     uint8_t *bytes = (uint8_t *) & value;
     
     uint8_t b0 = bytes[0];
@@ -42,7 +39,7 @@ uint32_t Nav61162_450::lsb2msb32 (uint32_t value) {
     return value;
 }
 
-void Nav61162_450::composeToken (IdString dest, Nav61162_450::TokenType tokenType) {
+void composeToken (IdString dest, MsgTokenType tokenType) {
     switch (tokenType) {
         case sentence:
             memcpy (dest, "UdPbC", 6); break;
@@ -57,45 +54,37 @@ void Nav61162_450::composeToken (IdString dest, Nav61162_450::TokenType tokenTyp
     }
 }
 
-void Nav61162_450::composeIdString (IdString dest, char *talker, uint16_t instance) {
+void composeIdString (IdString dest, char *talker, uint16_t instance) {
     memcpy (dest, talker, 2);
     sprintf (((char *) dest) + 2, "%04d", instance);
 }
 
-HANDLE Nav61162_450::openLog (char *path, bool wipeFile) {
-    static HANDLE log = INVALID_HANDLE_VALUE;
-    
-    if (log == INVALID_HANDLE_VALUE) {
-        static char savedPath [1000];
+FILE *openLog (char *path) {
+    static char savedPath [1000];
 
-        if (path) strcpy (savedPath, path);
+    if (path) strcpy (savedPath, path);
 
-        log = CreateFile (savedPath, GENERIC_WRITE, 0, 0, wipeFile ? CREATE_ALWAYS : OPEN_ALWAYS, 0, 0);
+    FILE *log = fopen (savedPath, "rb+");
 
-        if (log != INVALID_HANDLE_VALUE) SetFilePointer (log, 0, 0, SEEK_END);
-    }
+    if (!log) log = fopen (savedPath, "wb+");
+
+    if (log) fseek (log, 0, SEEK_END);
 
     return log;
 }
 
-void Nav61162_450::addTextToDump (char *text) {
-    HANDLE log = openLog (0, false);
+void addTextToDump (char *text) {
+    FILE *log = openLog (0);
     
-    if (log != INVALID_HANDLE_VALUE) {
-        unsigned long bytesWritten;
-        WriteFile (log, text, (unsigned long) strlen (text), & bytesWritten, 0);
-        //fclose (log);
+    if (log) {
+        fwrite (text, 1, strlen (text), log);
+        fclose (log);
     }
 }
 
-void Nav61162_450::cleanupLog (char *path) {
-    openLog (path, true);
-}
-
-void Nav61162_450::dump (char *path, uint8_t *data, size_t size, bool addTitle) {
-    HANDLE log = openLog (path, false);
-    unsigned long bytesWritten;
-    if (log == INVALID_HANDLE_VALUE) return;
+void dump (char *path, uint8_t *data, size_t size, bool addTitle) {
+    FILE *log = openLog (path);
+    if (!log) return;
 
     if (addTitle) {
         char title [200];
@@ -107,7 +96,7 @@ void Nav61162_450::dump (char *path, uint8_t *data, size_t size, bool addTitle) 
             "\n",
             size
         );
-        WriteFile (log, title, (unsigned long) strlen (title), & bytesWritten, 0);
+        fwrite (title, 1, strlen (title), log);
     }
 
     for (size_t offset = 0; offset < size; ) {
@@ -132,11 +121,11 @@ void Nav61162_450::dump (char *path, uint8_t *data, size_t size, bool addTitle) 
 
         for (size_t i = strlen (ascii); i < 16; ascii[i++] = ' ');
 
-        WriteFile (log, ascii, (unsigned long) strlen (ascii), & bytesWritten, 0);
-        WriteFile (log, hex, (unsigned long) strlen (hex), & bytesWritten, 0);
-        WriteFile (log, "\r\n", 2, & bytesWritten, 0);
+        fwrite (ascii, 1, strlen (ascii), log);
+        fwrite (hex, 1, strlen (hex), log);
+        fwrite ("\r\n", 1, 2, log);
     }
 
-    //fclose (log);
+    fclose (log);
 }
 

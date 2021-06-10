@@ -5,6 +5,7 @@
 #include <Shlwapi.h>
 #include <stdint.h>
 #include <time.h>
+#include <vector>
 
 #include "61162_450_defs.h"
 #include "61162_450_interface.h"
@@ -14,13 +15,13 @@ enum ErrorFlags {
 };
 
 struct Cfg {
-    in_addr bind;
-    in_addr group;
     uint16_t port;
     uint32_t flags;
-    int fakeAckAfterChunk;
+    int fakeAckAfterChunk, numberOfFakeAcks;
     char ourID [7];
-    bool openFile, cleanupLog;
+    bool stopWhenRetransmission, openImage;
+    time_t timeout;
+    char group [50], bind [50];
 };
 
 struct Ctx {
@@ -33,6 +34,10 @@ struct Ctx {
     sockaddr_in lastSender;
     HANDLE binaryFile;
     char mime [100];
+    int lastChunkProcessed;
+    std::vector<size_t> chunkOffsets;
+    bool retransmissionExpected;
+    int addZerosAfter;
 };
 
 const char *SECTION_CFG = "cfg";
@@ -41,33 +46,20 @@ const char *KEY_BIND = "bind";
 const char *KEY_GROUP = "group";
 const char *KEY_OUR_ID = "ourID";
 
-const char *NO_FINAL_ACK = "Do not send final ack as fake transmission fault mode active\n";
+const char *NO_FINAL_ACK = "\nDo not send final ack as fake transmission fault mode active\n";
 
-void loadCfg (Cfg& cfg) {
-    char path[MAX_PATH];
+const char *OPTIONS_SECTION = "options";
+const char *SETTINGS_SECTION = "settings";
 
-    auto getCfgInt = [path] (const char *key, int defValue) {
-        return GetPrivateProfileIntA (SECTION_CFG, key, defValue, path);
-    };
-    auto getCfgAddr = [path] (const char *key, char *defValue = "") {
-        char buffer [50];
-
-        GetPrivateProfileStringA (SECTION_CFG, key, defValue, buffer, sizeof (buffer), path);
-        
-        return *buffer ? inet_addr (buffer) : INADDR_ANY;
-    };
-
-    memset (& cfg, 0, sizeof (cfg));
-
-    GetModuleFileNameA (0, path, sizeof (path));
-    PathRemoveFileSpecA (path);
-    PathAppendA (path, "config.dat");
-
-    cfg.port = getCfgInt (KEY_PORT, 60026);
-    cfg.bind.S_un.S_addr = getCfgAddr (KEY_BIND);
-    cfg.group.S_un.S_addr = getCfgAddr (KEY_BIND, "239.192.0.26");
-
-    GetPrivateProfileStringA (SECTION_CFG, KEY_OUR_ID, "VR0001", cfg.ourID, sizeof (cfg.ourID), path);
+void initContext (Ctx& ctx) {
+    ctx.chunkOffsets.clear ();
+    ctx.chunkOffsets.push_back (0);
+    ctx.lastChunkProcessed = -1;
+    ctx.retransmissionExpected = false;
+    ctx.addZerosAfter = -1;
+    ctx.blockID = 0;
+    ctx.lastSeqNo = 0;
+    ctx.binaryFile = INVALID_HANDLE_VALUE;
 }
 
 SOCKET createSocket (Cfg& cfg) {
@@ -78,7 +70,7 @@ SOCKET createSocket (Cfg& cfg) {
 
     sockaddr_in bindData;
 
-    bindData.sin_addr.S_un.S_addr = cfg.bind.S_un.S_addr;
+    bindData.sin_addr.S_un.S_addr = *cfg.bind ? inet_addr (cfg.bind) : htonl (INADDR_LOOPBACK);
     bindData.sin_port = htons (cfg.port);
     bindData.sin_family = AF_INET;
 
@@ -87,9 +79,7 @@ SOCKET createSocket (Cfg& cfg) {
     } else {
         char hostName [100];
         ip_mreq request;
-        int bufSize = 20480000;
         
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *) & bufSize, sizeof (bufSize));
         gethostname (hostName, sizeof (hostName));
 
         auto hostEnt = gethostbyname (hostName);
@@ -103,12 +93,12 @@ SOCKET createSocket (Cfg& cfg) {
             }
         } else*/ {
             // Subscribe everything what is possible
-            request.imr_multiaddr.S_un.S_addr = cfg.group.S_un.S_addr;
+            request.imr_multiaddr.S_un.S_addr = inet_addr (cfg.group);
             request.imr_interface.S_un.S_addr = htonl (INADDR_LOOPBACK); //INADDR_ANY;
             setsockopt (sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) & request, sizeof (request));
 
             for (auto i = 0; hostEnt->h_addr_list [i]; ++ i) {
-                request.imr_multiaddr.S_un.S_addr = cfg.group.S_un.S_addr;
+                request.imr_multiaddr.S_un.S_addr = inet_addr (cfg.group);
                 memcpy (& request.imr_interface.s_addr, hostEnt->h_addr_list [i], 4);
                 setsockopt (sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) & request, sizeof (request));
             }
@@ -129,39 +119,53 @@ void showMultiLines (char *firstPrefix, char *prefix, char *multiLines, size_t a
     }
 }
 
-void showVersionAndTokenType (Nav61162_450::Header *hdr) {
+void showVersionAndTokenType (Header *hdr) {
     printf (
         "Incoming binary transmission\n"
         "\tVersion:\t%d\n"
         "\tToken:\t\t%s\n",
         hdr->version,
-        Nav61162_450::getTokenTypeName (Nav61162_450::getTokenType (hdr->token))
+        getTokenTypeName (getTokenType (hdr->token))
     );
 }
 
-void sendAck_v1 (Nav61162_450::Header1 *header, Ctx& ctx, char *title = 0) {
-    sockaddr_in dest;
-    Nav61162_450::Header1 ackHeader;
-    Nav61162_450::composeFinalAck_v1 (header, & ackHeader);
+void notifyLastChunkReceived (Ctx& ctx) {
+    if (!ctx.retransmissionExpected) printf ("Last chunk received, send ack back to sender.\n");
+}
 
-    dest.sin_addr.S_un.S_addr = ctx.config.group.S_un.S_addr;
+void sendAck_v1 (Header1 *header, Ctx& ctx, char *title = 0, int chunkIndex = -1) {
+    sockaddr_in dest;
+    Header1 ackHeader;
+    composeAck_v1 (header, & ackHeader, chunkIndex >= 0 ? chunkIndex : header->seqNum);
+
+    dest.sin_addr.S_un.S_addr = inet_addr (ctx.config.group);
     dest.sin_port = htons (ctx.config.port);
     dest.sin_family = AF_INET;
 
-    printf (title ? title : "Last chunk received, send ack back to sender.\n");
+    if (!title) {
+        notifyLastChunkReceived (ctx);
+    } else if (*title) {
+        printf (title);
+    }
+    
     sendto (ctx.sock, (char *) & ackHeader, sizeof (ackHeader), 0, (sockaddr *) & dest, sizeof (dest));
 }
 
-void sendAck_v2 (Nav61162_450::Header2 *header, Ctx& ctx, char *title = 0) {
+void sendAck_v2 (Header2 *header, Ctx& ctx, char *title = 0, int chunkIndex = -1) {
     sockaddr_in dest;
-    Nav61162_450::Header2 ackHeader;
-    Nav61162_450::composeFinalAck_v2 (header, & ackHeader);
+    Header2 ackHeader;
+    composeAck_v2 (header, & ackHeader, chunkIndex >= 0 ? chunkIndex + 1 : header->seqNum);
 
-    dest.sin_addr.S_un.S_addr = ctx.config.group.S_un.S_addr;
+    dest.sin_addr.S_un.S_addr = inet_addr (ctx.config.group);
     dest.sin_port = htons (ctx.ackDestPort);
     dest.sin_family = AF_INET;
 
-    printf (title ? title : "Last chunk received, send ack back to sender.\n");
+    if (!title) {
+        notifyLastChunkReceived (ctx);
+    } else if (*title) {
+        printf (title);
+    }
+
     sendto (ctx.sock, (char *) & ackHeader, sizeof (ackHeader), 0, (sockaddr *) & dest, sizeof (dest));
 }
 
@@ -191,35 +195,49 @@ void createBinaryFile (Ctx& ctx, char *dataType) {
     printf ("Binary file %s is saving.\n", path);
 }
 
-void addChunkToBinaryFile (Ctx& ctx, char *data, size_t size) {
+void addChunkToBinaryFile (Ctx& ctx, int chunkIndex, char *data, size_t size) {
     unsigned long bytesWritten;
 
+    SetFilePointer (ctx.binaryFile, ctx.chunkOffsets [chunkIndex], 0, SEEK_SET);
     WriteFile (ctx.binaryFile, data, size, & bytesWritten, 0);
+}
+
+void addZerosToBinaryFile (Ctx& ctx, int chunkIndex, size_t size) {
+    char buffer [2000];
+    unsigned long bytesWritten;
+
+    memset (buffer, 0, size);
+    SetFilePointer (ctx.binaryFile, ctx.chunkOffsets [chunkIndex], 0, SEEK_SET);
+    WriteFile (ctx.binaryFile, buffer, size, & bytesWritten, 0);
 }
 
 void finalizeBinaryFile (Ctx& ctx) {
     if (ctx.binaryFile != INVALID_HANDLE_VALUE) {
         char path [MAX_PATH];
-        GetFinalPathNameByHandle (ctx.binaryFile, path, sizeof (path), 0);
-        
+
         printf ("\nFinalizing the binary file.\n");
+
+        if (ctx.config.openImage) {
+            GetFinalPathNameByHandle (ctx.binaryFile, path, sizeof (path), 0);
+        }
+
         CloseHandle (ctx.binaryFile);
 
-        if (ctx.config.openFile) {
+        if (ctx.config.openImage) {
             ShellExecute (GetConsoleWindow (), "open", path, 0, 0, SW_SHOW);
         }
     }
 }
 
 void notifyQueryReceived () {
-    printf ("\nQuery received from the sender\n");
+    printf ("Query received from the sender\n");
 }
 
-void processQuery_v1 (Nav61162_450::Header1 *header, Ctx& ctx) {
+void processQuery_v1 (Header1 *header, Ctx& ctx) {
     notifyQueryReceived ();
 }
 
-void processQuery_v2 (Nav61162_450::Header2 *header, Ctx& ctx) {
+void processQuery_v2 (Header2 *header, Ctx& ctx) {
     notifyQueryReceived ();
 
     // No response to ack before all chunks have been received
@@ -233,11 +251,11 @@ void notifyAckReceived () {
     printf ("Ack received from the sender\n");
 }
 
-void processAck_v1 (Nav61162_450::Header1 *header, Ctx& ctx) {
+void processAck_v1 (Header1 *header, Ctx& ctx) {
     notifyAckReceived ();
 }
 
-void processAck_v2 (Nav61162_450::Header2 *header, Ctx& ctx) {
+void processAck_v2 (Header2 *header, Ctx& ctx) {
     notifyAckReceived ();
 }
 
@@ -245,130 +263,141 @@ void notifyChunkReceived (uint32_t seqNum, uint32_t maxSeqNum, uint32_t amount) 
     printf ("Received chunk %d of %d (%d bytes)         \r", seqNum, maxSeqNum, amount);
 }
 
-void dumpHeader_v1 (Nav61162_450::Header1 *header) {
-    Nav61162_450::addTextToDump ("\n*** Header ***\n");
-    Nav61162_450::dump (0, (uint8_t *) header, sizeof (*header), false);
-    Nav61162_450::addTextToDump ("\n*** Parsed details ***\n");
-    Nav61162_450::addTextToDump ("Token\n");
-    Nav61162_450::dump (0, (uint8_t *) header->token, sizeof (header->token), false);
-    Nav61162_450::addTextToDump ("Version\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->version, sizeof (header->version), false);
-    Nav61162_450::addTextToDump ("Source ID\n");
-    Nav61162_450::dump (0, (uint8_t *) header->sourceID, sizeof (header->sourceID), false);
-    Nav61162_450::addTextToDump ("Dest ID\n");
-    Nav61162_450::dump (0, (uint8_t *) header->destID, sizeof (header->destID), false);
-    Nav61162_450::addTextToDump ("Msg type\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->type, sizeof (header->type), false);
-    Nav61162_450::addTextToDump ("Block ID\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->blockID, sizeof (header->blockID), false);
-    Nav61162_450::addTextToDump ("Seq num\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->seqNum, sizeof (header->seqNum), false);
-    Nav61162_450::addTextToDump ("Max seq num\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->maxSeqNum, sizeof (header->maxSeqNum), false);
+void dumpHeader_v1 (Header1 *header) {
+    addTextToDump ("\n*** Header ***\n");
+    dump (0, (uint8_t *) header, sizeof (*header), false);
+    addTextToDump ("\n*** Parsed details ***\n");
+    addTextToDump ("Token\n");
+    dump (0, (uint8_t *) header->token, sizeof (header->token), false);
+    addTextToDump ("Version\n");
+    dump (0, (uint8_t *) & header->version, sizeof (header->version), false);
+    addTextToDump ("Source ID\n");
+    dump (0, (uint8_t *) header->sourceID, sizeof (header->sourceID), false);
+    addTextToDump ("Dest ID\n");
+    dump (0, (uint8_t *) header->destID, sizeof (header->destID), false);
+    addTextToDump ("Msg type\n");
+    dump (0, (uint8_t *) & header->type, sizeof (header->type), false);
+    addTextToDump ("Block ID\n");
+    dump (0, (uint8_t *) & header->blockID, sizeof (header->blockID), false);
+    addTextToDump ("Seq num\n");
+    dump (0, (uint8_t *) & header->seqNum, sizeof (header->seqNum), false);
+    addTextToDump ("Max seq num\n");
+    dump (0, (uint8_t *) & header->maxSeqNum, sizeof (header->maxSeqNum), false);
 }
 
-void dumpHeader_v2 (Nav61162_450::Header2 *header) {
-    Nav61162_450::addTextToDump ("\n*** Header ***\n");
-    Nav61162_450::dump (0, (uint8_t *) header, sizeof (*header), false);
-    Nav61162_450::addTextToDump ("\n*** Parsed details ***\n");
-    Nav61162_450::addTextToDump ("Token\n");
-    Nav61162_450::dump (0, (uint8_t *) header->token, sizeof (header->token), false);
-    Nav61162_450::addTextToDump ("Version\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->version, sizeof (header->version), false);
-    Nav61162_450::addTextToDump ("Header length\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->headerLength, sizeof (header->headerLength), false);
-    Nav61162_450::addTextToDump ("Source ID\n");
-    Nav61162_450::dump (0, (uint8_t *) header->sourceID, sizeof (header->sourceID), false);
-    Nav61162_450::addTextToDump ("Dest ID\n");
-    Nav61162_450::dump (0, (uint8_t *) header->destID, sizeof (header->destID), false);
-    Nav61162_450::addTextToDump ("Msg type\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->type, sizeof (header->type), false);
-    Nav61162_450::addTextToDump ("Block ID\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->blockID, sizeof (header->blockID), false);
-    Nav61162_450::addTextToDump ("Seq num\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->seqNum, sizeof (header->seqNum), false);
-    Nav61162_450::addTextToDump ("Max seq num\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->maxSeqNum, sizeof (header->maxSeqNum), false);
-    Nav61162_450::addTextToDump ("Device\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->device, sizeof (header->device), false);
-    Nav61162_450::addTextToDump ("Channel\n");
-    Nav61162_450::dump (0, (uint8_t *) & header->channel, sizeof (header->channel), false);
+void dumpHeader_v2 (Header2 *header) {
+    addTextToDump ("\n*** Header ***\n");
+    dump (0, (uint8_t *) header, sizeof (*header), false);
+    addTextToDump ("\n*** Parsed details ***\n");
+    addTextToDump ("Token\n");
+    dump (0, (uint8_t *) header->token, sizeof (header->token), false);
+    addTextToDump ("Version\n");
+    dump (0, (uint8_t *) & header->version, sizeof (header->version), false);
+    addTextToDump ("Header length\n");
+    dump (0, (uint8_t *) & header->headerLength, sizeof (header->headerLength), false);
+    addTextToDump ("Source ID\n");
+    dump (0, (uint8_t *) header->sourceID, sizeof (header->sourceID), false);
+    addTextToDump ("Dest ID\n");
+    dump (0, (uint8_t *) header->destID, sizeof (header->destID), false);
+    addTextToDump ("Msg type\n");
+    dump (0, (uint8_t *) & header->type, sizeof (header->type), false);
+    addTextToDump ("Block ID\n");
+    dump (0, (uint8_t *) & header->blockID, sizeof (header->blockID), false);
+    addTextToDump ("Seq num\n");
+    dump (0, (uint8_t *) & header->seqNum, sizeof (header->seqNum), false);
+    addTextToDump ("Max seq num\n");
+    dump (0, (uint8_t *) & header->maxSeqNum, sizeof (header->maxSeqNum), false);
+    addTextToDump ("Device\n");
+    dump (0, (uint8_t *) & header->device, sizeof (header->device), false);
+    addTextToDump ("Channel\n");
+    dump (0, (uint8_t *) & header->channel, sizeof (header->channel), false);
 }
 
 void dumpData (char *data, size_t size) {
     char title [100];
     sprintf (title, "Data chunk (%zd bytes)\n", size);
-    Nav61162_450::addTextToDump (title);
-    Nav61162_450::dump (0, (uint8_t *) data, size, false);
+    addTextToDump (title);
+    dump (0, (uint8_t *) data, size, false);
 }
 
-void dumpFileDesc_v1 (Nav61162_450::FileDesc1 *desc) {
+void dumpFileDesc_v1 (FileDesc1 *desc) {
     size_t descLength = htonl (desc->length);
     size_t statusLength = descLength - (((uint8_t *) desc->textInfo - (uint8_t *) desc) + desc->typeLength);
 
-    Nav61162_450::addTextToDump ("\n*** File descriptor ***\n");
-    Nav61162_450::dump (0, (uint8_t *) desc, descLength, false);
-    Nav61162_450::addTextToDump ("\n*** Parsed details ***\n");
-    Nav61162_450::addTextToDump ("Length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->length, sizeof (desc->length), false);
-    Nav61162_450::addTextToDump ("File length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->fileLength, sizeof (desc->fileLength), false);
-    Nav61162_450::addTextToDump ("Status of ackquisition\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->ackStatus, sizeof (desc->ackStatus), false);
-    Nav61162_450::addTextToDump ("Device\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->device, sizeof (desc->device), false);
-    Nav61162_450::addTextToDump ("Channel\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->channel, sizeof (desc->channel), false);
-    Nav61162_450::addTextToDump ("Type length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->typeLength, sizeof (desc->typeLength), false);
-    Nav61162_450::addTextToDump ("Data type\n");
-    Nav61162_450::dump (0, (uint8_t *) desc->textInfo, desc->typeLength, false);
-    Nav61162_450::addTextToDump ("Status and information text\n");
-    Nav61162_450::dump (0, (uint8_t *) desc->textInfo + desc->typeLength, statusLength, false);
+    addTextToDump ("\n*** File descriptor ***\n");
+    dump (0, (uint8_t *) desc, descLength, false);
+    addTextToDump ("\n*** Parsed details ***\n");
+    addTextToDump ("Length\n");
+    dump (0, (uint8_t *) & desc->length, sizeof (desc->length), false);
+    addTextToDump ("File length\n");
+    dump (0, (uint8_t *) & desc->fileLength, sizeof (desc->fileLength), false);
+    addTextToDump ("Status of ackquisition\n");
+    dump (0, (uint8_t *) & desc->ackStatus, sizeof (desc->ackStatus), false);
+    addTextToDump ("Device\n");
+    dump (0, (uint8_t *) & desc->device, sizeof (desc->device), false);
+    addTextToDump ("Channel\n");
+    dump (0, (uint8_t *) & desc->channel, sizeof (desc->channel), false);
+    addTextToDump ("Type length\n");
+    dump (0, (uint8_t *) & desc->typeLength, sizeof (desc->typeLength), false);
+    addTextToDump ("Data type\n");
+    dump (0, (uint8_t *) desc->textInfo, desc->typeLength, false);
+    addTextToDump ("Status and information text\n");
+    dump (0, (uint8_t *) desc->textInfo + desc->typeLength, statusLength, false);
 }
 
-void dumpFileDesc_v2 (Nav61162_450::FileDesc2 *desc) {
+void dumpFileDesc_v2 (FileDesc2 *desc) {
     size_t descLength = htonl (desc->length);
     size_t statusLength = descLength - (((uint8_t *) desc->textInfo - (uint8_t *) desc) + desc->typeLength);
 
-    Nav61162_450::addTextToDump ("\n*** File descriptor ***\n");
-    Nav61162_450::dump (0, (uint8_t *) desc, descLength, false);
-    Nav61162_450::addTextToDump ("\n*** Parsed details ***\n");
-    Nav61162_450::addTextToDump ("Length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->length, sizeof (desc->length), false);
-    Nav61162_450::addTextToDump ("File length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->fileLength, sizeof (desc->fileLength), false);
-    Nav61162_450::addTextToDump ("Status of ackquisition\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->ackStatus, sizeof (desc->ackStatus), false);
-    Nav61162_450::addTextToDump ("Dest ack port\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->ackDestPort, sizeof (desc->ackDestPort), false);
-    Nav61162_450::addTextToDump ("Type length\n");
-    Nav61162_450::dump (0, (uint8_t *) & desc->typeLength, sizeof (desc->typeLength), false);
-    Nav61162_450::addTextToDump ("Data type\n");
-    Nav61162_450::dump (0, (uint8_t *) desc->textInfo, desc->typeLength, false);
-    Nav61162_450::addTextToDump ("Status length\n");
-    Nav61162_450::dump (0, (uint8_t *) desc->textInfo + desc->typeLength, 2, false);
-    Nav61162_450::addTextToDump ("Status and information text\n");
-    Nav61162_450::dump (0, (uint8_t *) desc->textInfo + desc->typeLength + 2, statusLength, false);
+    addTextToDump ("\n*** File descriptor ***\n");
+    dump (0, (uint8_t *) desc, descLength, false);
+    addTextToDump ("\n*** Parsed details ***\n");
+    addTextToDump ("Length\n");
+    dump (0, (uint8_t *) & desc->length, sizeof (desc->length), false);
+    addTextToDump ("File length\n");
+    dump (0, (uint8_t *) & desc->fileLength, sizeof (desc->fileLength), false);
+    addTextToDump ("Status of ackquisition\n");
+    dump (0, (uint8_t *) & desc->ackStatus, sizeof (desc->ackStatus), false);
+    addTextToDump ("Dest ack port\n");
+    dump (0, (uint8_t *) & desc->ackDestPort, sizeof (desc->ackDestPort), false);
+    addTextToDump ("Type length\n");
+    dump (0, (uint8_t *) & desc->typeLength, sizeof (desc->typeLength), false);
+    addTextToDump ("Data type\n");
+    dump (0, (uint8_t *) desc->textInfo, desc->typeLength, false);
+    addTextToDump ("Status length\n");
+    dump (0, (uint8_t *) desc->textInfo + desc->typeLength, 2, false);
+    addTextToDump ("Status and information text\n");
+    dump (0, (uint8_t *) desc->textInfo + desc->typeLength + 2, statusLength, false);
+}
+
+void storeNextChunkOffset (Ctx& ctx, int curChunkIndex, size_t curChunkSize) {
+    if (ctx.chunkOffsets.size () > curChunkIndex) {
+        if (ctx.chunkOffsets.size () == (curChunkIndex + 1)) {
+            ctx.chunkOffsets.push_back (ctx.chunkOffsets.back () + curChunkSize);
+        } else {
+            ctx.chunkOffsets [curChunkIndex+1] = ctx.chunkOffsets [curChunkIndex] + curChunkSize;
+        }
+    }
 }
 
 void parseChunk (char *stream, int amount, Ctx& ctx) {
     char buffer [2000];
     size_t size;
-    Nav61162_450::Header *hdr = (Nav61162_450::Header *) buffer;
+    Header *hdr = (Header *) buffer;
     uint8_t version = hdr->version;
 
-    Nav61162_450::extractHeader ((uint8_t *) stream, buffer, & version, & size);
+    extractHeader ((uint8_t *) stream, buffer, & version, & size);
 
     char *binaryData;
     char ids [20], statusInfo [500], dataType [100];
     size_t dataTypeSize = sizeof (dataType), statusInfoSize = sizeof (statusInfo), fileDescSize, fileSize;
     uint8_t channel, device;
     uint16_t ackStatus, ackDestPort;
+    int chunkIndex;
     bool lastChunk = false;
 
     if (version == 1) {
-        Nav61162_450::Header1 *header = (Nav61162_450::Header1 *) buffer;
+        Header1 *header = (Header1 *) buffer;
 
         // Dumping the header
         dumpHeader_v1 (header);
@@ -377,29 +406,36 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
         if (memcmp (header->sourceID, ctx.config.ourID, 6) == 0) return;
 
         switch (header->type) {
-            case Nav61162_450::MsgType::DATA: {
+            case MsgType::DATA: {
                 // A normal data chunk received
+                if (ctx.blockID == 0) ctx.blockID = header->blockID;
+                
                 if (header->blockID == ctx.blockID) {
-                    ctx.lastSeqNo = header->seqNum; 
+                    ctx.lastSeqNo = header->seqNum;
+                    chunkIndex = header->seqNum;
+                } else {
+                    // wrong block came, to be processed later on
                 }
                 break;
             }
-            case Nav61162_450::MsgType::QUERY: {
+            case MsgType::QUERY: {
                 processQuery_v1 (header, ctx); return;
             }
-            case Nav61162_450::MsgType::ACK: {
+            case MsgType::ACK: {
                 processAck_v1 (header, ctx); return;
             }
         }
 
+        notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+
         if (header->seqNum == 0) {
             // First chunk found
-            Nav61162_450::FileDesc1 *fileDesc = (Nav61162_450::FileDesc1 *)((uint8_t *) stream + sizeof (*header));
+            FileDesc1 *fileDesc = (FileDesc1 *)((uint8_t *) stream + sizeof (*header));
 
             // Dumping file descriptor
             dumpFileDesc_v1 (fileDesc);
 
-            Nav61162_450::extractFileDescriptor_v1 (
+            extractFileDescriptor_v1 (
                 (uint8_t *) stream + sizeof (*header),
                 & fileDescSize,
                 & fileSize,
@@ -436,7 +472,7 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
                 "\tdata type:\t%s\n",
                 ids,
                 ids + 7,
-                Nav61162_450::getTokenTypeName ((Nav61162_450::TokenType) header->type),
+                getTokenTypeName ((MsgTokenType) header->type),
                 header->blockID,
                 device,
                 channel,
@@ -445,14 +481,33 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
             );
             createBinaryFile (ctx, dataType);
             showMultiLines ("\tStatus info:\n", "", statusInfo, statusInfoSize);
-            notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+            //notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+        } else if (header->seqNum > (ctx.lastChunkProcessed + 1)) {
+            // It seems that some chunks have been lost, send an error ack
+            sendAck_v1 (header, ctx, "", ctx.lastChunkProcessed);
+            
+            ctx.retransmissionExpected = true; return;
         } else {
+            if (header->seqNum <= ctx.lastChunkProcessed) {
+                printf ("\nRetransmission attempt detected\n");
+
+                if (ctx.config.stopWhenRetransmission) {
+                    printf ("Exiting as the command line parameter -sr present.\n");
+                    exit (0);
+                }
+
+                ctx.retransmissionExpected = false;
+                ctx.addZerosAfter = -1;
+            }
+
             if (header->seqNum == header->maxSeqNum) {
                 lastChunk = true;
 
                 notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
 
-                if ((ctx.config.flags & ErrorFlags::SUPPRESS_FINAL_ACK) == 0) {
+                if (ctx.retransmissionExpected) {
+                    printf (NO_FINAL_ACK);
+                } else if ((ctx.config.flags & ErrorFlags::SUPPRESS_FINAL_ACK) == 0) {
                     if (ctx.config.fakeAckAfterChunk < 0) {
                         sendAck_v1 (header, ctx);
                     } else {
@@ -472,10 +527,24 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
 
         if (ctx.config.fakeAckAfterChunk == header->seqNum) {
             // Imitate a transmission error
-            sendAck_v1 (header, ctx, "Imitate wrong reception\n");
+            ctx.retransmissionExpected = true;
+            
+            // Force to write a wrong data
+            ctx.addZerosAfter = chunkIndex;
+
+            sendAck_v1 (header, ctx, "Imitate wrong reception\n", chunkIndex);
+
+            // Decrease fault counter, suppress fake ack mode
+            if ((--ctx.config.numberOfFakeAcks) == 0) {
+                // do not force fake ack anymore, later we operate as usual
+                ctx.config.fakeAckAfterChunk = -1;
+            } else {
+                // Next time we make a fake ack for the next packet
+                ++ ctx.config.fakeAckAfterChunk;
+            }
         }
     } else if (hdr->version == 2) {
-        Nav61162_450::Header2 *header = (Nav61162_450::Header2 *) buffer;
+        Header2 *header = (Header2 *) buffer;
 
         // Dumping the header
         dumpHeader_v2 (header);
@@ -484,28 +553,35 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
         if (memcmp (header->sourceID, ctx.config.ourID, 6) == 0) return;
 
         switch (header->type) {
-            case Nav61162_450::MsgType::DATA: {
+            case MsgType::DATA: {
                 // A normal data chunk received
+                if (ctx.blockID == 0) ctx.blockID = header->blockID;
+
                 if (header->blockID == ctx.blockID) {
                     ctx.lastSeqNo = header->seqNum; 
+                    chunkIndex = header->seqNum - 1;
+                } else {
+                    // wrong block came, to be processed later on
                 }
                 break;
             }
-            case Nav61162_450::MsgType::QUERY: {
+            case MsgType::QUERY: {
                 processQuery_v2 (header, ctx); return;
             }
-            case Nav61162_450::MsgType::ACK: {
+            case MsgType::ACK: {
                 processAck_v2 (header, ctx); return;
             }
         }
             
+        notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+        
         if (header->seqNum == 1) {
             // First chunk found
-            Nav61162_450::FileDesc2 *fileDesc = (Nav61162_450::FileDesc2 *)((uint8_t *) stream + sizeof (*header));
+            FileDesc2 *fileDesc = (FileDesc2 *)((uint8_t *) stream + sizeof (*header));
 
             dumpFileDesc_v2 (fileDesc);
 
-            Nav61162_450::extractFileDescriptor_v2 (
+            extractFileDescriptor_v2 (
                 (uint8_t *) stream + sizeof (*header),
                 & fileDescSize,
                 & fileSize,
@@ -542,7 +618,7 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
                 "\tdata type:\t%s\n",
                 ids,
                 ids + 7,
-                Nav61162_450::getTokenTypeName ((Nav61162_450::TokenType) header->type),
+                getTokenTypeName ((MsgTokenType) header->type),
                 header->blockID,
                 header->device,
                 header->channel,
@@ -552,14 +628,33 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
             );
             createBinaryFile (ctx, dataType);
             showMultiLines ("\tStatus info:\n", "", statusInfo, statusInfoSize);
-            notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+            //notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
+        } else if (header->seqNum > (ctx.lastChunkProcessed + 2)) {
+            // It seems that some chunks have been lost, send an error ack
+            sendAck_v2 (header, ctx, "", ctx.lastChunkProcessed);
+            
+            ctx.retransmissionExpected = true; return;
         } else {
+            if (header->seqNum <= ctx.lastChunkProcessed) {
+                printf ("\nRetransmission attempt detected\n");
+
+                if (ctx.config.stopWhenRetransmission) {
+                    printf ("Exiting as the command line parameter -sr present.\n");
+                    exit (0);
+                }
+
+                ctx.retransmissionExpected = false;
+                ctx.addZerosAfter = -1;
+            }
+
             if (header->seqNum == header->maxSeqNum) {
                 lastChunk = true;
                 
                 notifyChunkReceived (header->seqNum, header->maxSeqNum, amount);
 
-                if ((ctx.config.flags & ErrorFlags::SUPPRESS_FINAL_ACK) == 0) {
+                if (ctx.retransmissionExpected) {
+                    printf (NO_FINAL_ACK);
+                } else if ((ctx.config.flags & ErrorFlags::SUPPRESS_FINAL_ACK) == 0) {
                     if (ctx.config.fakeAckAfterChunk < 0) {
                         sendAck_v2 (header, ctx);
                     } else {
@@ -579,18 +674,40 @@ void parseChunk (char *stream, int amount, Ctx& ctx) {
 
         if (ctx.config.fakeAckAfterChunk == header->seqNum) {
             // Imitate a transmission error
-            sendAck_v2 (header, ctx, "Imitate wrong reception\n");
+            ctx.retransmissionExpected = true;
+
+            // Force to write a wrong data
+            ctx.addZerosAfter = chunkIndex;
+
+            sendAck_v2 (header, ctx, "Imitate wrong reception\n", chunkIndex);
+
+            // Decrease fault counter, suppress fake ack mode
+            if ((--ctx.config.numberOfFakeAcks) == 0) {
+                // do not force fake ack anymore, later we operate as usual
+                ctx.config.fakeAckAfterChunk = -1;
+            } else {
+                // Next time we make a fake ack for the next packet
+                ++ ctx.config.fakeAckAfterChunk;
+            }
         }
     } else {
         printf ("Invalid version %d - ignoring\n", version); return;
     }
 
-    addChunkToBinaryFile (ctx, binaryData, amount - (binaryData - stream));
+    auto dataSize = amount - (binaryData - stream);
+    storeNextChunkOffset (ctx, chunkIndex, dataSize);
 
-    if (lastChunk) {
+    if (ctx.addZerosAfter >= 0 && chunkIndex > ctx.addZerosAfter) {
+        addZerosToBinaryFile (ctx, chunkIndex, dataSize);
+    } else {
+        addChunkToBinaryFile (ctx, chunkIndex, binaryData, dataSize);
+    }
+
+     ctx.lastChunkProcessed = chunkIndex;
+
+    if (lastChunk && !ctx.retransmissionExpected) {
         finalizeBinaryFile (ctx);
-
-        ctx.lastSeqNo = 0;
+        initContext (ctx);
     }
 }
 
@@ -598,11 +715,15 @@ void showUsage () {
     printf (
         "bfrs [options]\n\n"
         "where options may be:\n"
-        "\t-c\tcleans the dump file up at start\n"
-        "\t-o\topens the received file after sucessful receiption\n"
-        "\t-sfa\tsupresses final ack send back to sender\n"
-        "\t-fa:nnn\tfake acknowledge after chunk nnn\n"
+        "\t-sr stops when retransmission detected (to demonstrate a corrupted file)\n"
+        "\t-sfa supresses final ack send back to sender\n"
+        "\t-fa:nnn fake acknowledge after chunk nnn\n"
     );
+}
+
+void onTimeoutExpired (Ctx& ctx) {
+    printf ("\nTimeout expired, awating cancelled.\n");
+    initContext (ctx);
 }
 
 int main (int argCount, char *args []) {
@@ -613,67 +734,93 @@ int main (int argCount, char *args []) {
     
     WSAStartup (0x0202, & data);
 
-    loadCfg (ctx.config);
-
     ctx.config.flags = 0;
     ctx.config.fakeAckAfterChunk = -1;
-    ctx.config.openFile = false;
+    ctx.blockID = 0;
+    ctx.binaryFile = INVALID_HANDLE_VALUE;
 
-    for (int i = 1; i < argCount; ++ i) {
-        char *arg = args [i];
+    char cfgPath [MAX_PATH];
+    GetModuleFileName (0, cfgPath, sizeof (cfgPath));
+    PathRenameExtension (cfgPath, ".cfg");
 
-        if (stricmp (arg, "-?") == 0 || stricmp (arg, "-h") == 0) {
-            showUsage ();
-            exit (0);
-        }
+    if (PathFileExists (cfgPath)) {
+        ctx.config.fakeAckAfterChunk = GetPrivateProfileInt (OPTIONS_SECTION, "sendFakeAckAfterChunk", -1, cfgPath);
+        ctx.config.numberOfFakeAcks = GetPrivateProfileInt (OPTIONS_SECTION, "numberOfFakeAcks", 1, cfgPath);
+        ctx.config.stopWhenRetransmission = GetPrivateProfileInt (OPTIONS_SECTION, "stopWhenRetransmitting", 0, cfgPath) != 0;
+        ctx.config.openImage = GetPrivateProfileInt (OPTIONS_SECTION, "openImage", 0, cfgPath) != 0;
+        ctx.config.port = GetPrivateProfileInt (SETTINGS_SECTION, "port", 6026, cfgPath);
+        ctx.config.timeout = GetPrivateProfileInt (SETTINGS_SECTION, "timeout", 1000, cfgPath);
 
-        if (stricmp (arg, "-sfa") == 0) {
+        if (GetPrivateProfileInt (OPTIONS_SECTION, "suppressFinalAck", 0, cfgPath) != 0) {
             ctx.config.flags |= ErrorFlags::SUPPRESS_FINAL_ACK;
         }
-        if (strnicmp (arg, "-fa:", 4) == 0) {
-            ctx.config.fakeAckAfterChunk = atoi (arg + 4);
-        }
-        if (strnicmp (arg, "-o", 2) == 0) {
-            ctx.config.openFile = true;
-        }
-        if (strnicmp (arg, "-c", 2) == 0) {
-            ctx.config.cleanupLog = true;
+
+        GetPrivateProfileString (SETTINGS_SECTION, "group", "239.192.0.26", ctx.config.group, sizeof (ctx.config.group), cfgPath);
+        GetPrivateProfileString (SETTINGS_SECTION, "bind", "", ctx.config.bind, sizeof (ctx.config.bind), cfgPath);
+        GetPrivateProfileString (SETTINGS_SECTION, "ourID", "VR0001", ctx.config.ourID, sizeof (ctx.config.ourID), cfgPath);
+    } else {
+        for (int i = 1; i < argCount; ++ i) {
+            char *arg = args [i];
+
+            if (stricmp (arg, "-?") == 0 || stricmp (arg, "-h") == 0) {
+                showUsage ();
+                exit (0);
+            }
+
+            if (stricmp (arg, "-sr") == 0) {
+                ctx.config.stopWhenRetransmission = true;
+            }
+
+            if (stricmp (arg, "-sfa") == 0) {
+                ctx.config.flags |= ErrorFlags::SUPPRESS_FINAL_ACK;
+            }
+
+            if (strnicmp (arg, "-fa:", 4) == 0) {
+                ctx.config.fakeAckAfterChunk = atoi (arg + 4);
+            }
         }
     }
 
     ctx.sock = createSocket (ctx.config);
     ctx.binaryFile = INVALID_HANDLE_VALUE;
 
+    initContext (ctx);
+
     char buffer [2000];
     unsigned long bytesAvailable;
     int senderSize;
+
+    printf ("Waiting for data...\n");
 
     char logPath [MAX_PATH];
     GetModuleFileName (0, logPath, sizeof (logPath));
     PathRenameExtension (logPath, ".dmp");
 
-    if (ctx.config.cleanupLog) {
-        printf ("Wiping log off...\n");
-        Nav61162_450::cleanupLog (logPath);
-    }
-
-    printf ("Waiting for data...\n");
+    time_t lastReceiption = 0;
 
     while (true) {
-        bytesAvailable = 0;
-        int result = ioctlsocket (ctx.sock, FIONREAD, & bytesAvailable);
-        if (result == 0 && bytesAvailable > 0) {
-            sockaddr_in sender;
-            senderSize = sizeof (sender);
+        time_t now = time (0);
 
-            auto bytesRead = recvfrom (ctx.sock, buffer, bytesAvailable, 0, (sockaddr *) & sender, & senderSize);
+        if ((lastReceiption > 0) && ((now - lastReceiption) > ctx.config.timeout)) {
+            lastReceiption = 0;
+            onTimeoutExpired (ctx);
+        } else {
+            bytesAvailable = 0;
+            int result = ioctlsocket (ctx.sock, FIONREAD, & bytesAvailable);
+            if (result == 0 && bytesAvailable > 0) {
+                sockaddr_in sender;
+                senderSize = sizeof (sender);
 
-            if (bytesRead > 0) {
-                Nav61162_450::dump (logPath, (uint8_t *) buffer, bytesRead);
+                lastReceiption = now;
+
+                auto bytesRead = recvfrom (ctx.sock, buffer, bytesAvailable, 0, (sockaddr *) & sender, & senderSize);
+
+                dump (logPath, (uint8_t *) buffer, bytesRead);
                 parseChunk (buffer, bytesRead, ctx);
             }
         }
-        Sleep ((DWORD) 0);
+
+        Sleep ((DWORD) 5);
     }
 
     closesocket (ctx.sock);
